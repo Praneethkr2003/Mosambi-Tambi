@@ -1,22 +1,34 @@
 """
-Mosambi Matchmaking — Streamlit Application (Mind Orchestration)
-================================================================
-New flow:
-  User fills ONE profile (UserContext) + picks their goals + selects an event
-      ↓
-  Mind.plan() decides which matchers to invoke
-      ↓
-  service.run_for_user() scores against the appropriate pools, persists to store
-      ↓
-  Mind.recommend_for_user() reads the store → categorized recommendations
-      ↓
-  UI renders: 👤 People · 🏢 Companies · 💰 Investors — in separate sections
+Mosambi Matchmaking — Streamlit Application (Proactive Recommendations)
+========================================================================
+Product philosophy:
+  User provides profile + selects an event.
+  System understands who they are and what context they are in.
+  System proactively discovers relevant people, organizations, and investors.
+  User explores — no goal selection required.
 
-The user is never asked for the same information twice.
+Flow:
+  UserContext (enter once)
+        ↓
+  Mind.plan()  [profile-driven — no goals needed]
+        ↓
+  service.run_for_user()  [scores against people_pool + org_pool]
+        ↓
+  RelationshipStore  [evidence persisted]
+        ↓
+  Mind.recommend_for_user()  →  RecommendationEngine
+        ↓
+  list[RecommendedCandidate]  [deduped, categorized, explained]
+        ↓
+  UI: "Recommended for You"
+       ├── People you may want to meet
+       ├── Organizations worth exploring
+       └── Potential investors
 """
 from __future__ import annotations
 
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,11 +36,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import streamlit as st
 
 from core.context import (
-    UserContext, EventContext, GoalType,
-    infer_goal_types, missing_fields, GOAL_LABELS,
+    UserContext, EventContext,
+    GoalType, infer_goal_types, missing_fields, to_event_profile,
 )
-from core.models import RecommendationCategory
-from mind.mind import Mind, CategorizedRecommendation
+from mind.mind import Mind
+from mind.recommendation import RecommendedCandidate
 from relationships.store import InMemoryRelationshipStore
 from service import MatchmakingService
 from sample_data import EVENT_ATTENDEES, ORGANIZATIONS
@@ -36,36 +48,45 @@ from sample_data import EVENT_ATTENDEES, ORGANIZATIONS
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Mosambi · Mind",
+    page_title="Mosambi",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── CSS — only for custom HTML widgets ───────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <style>
 #MainMenu, footer, header { visibility: hidden; }
 
-.rank-circle {
+.rank-badge {
     display: inline-flex; align-items: center; justify-content: center;
-    width: 46px; height: 46px; border-radius: 50%;
-    font-size: 0.95rem; font-weight: 800; color: #fff;
+    width: 42px; height: 42px; border-radius: 50%;
+    font-size: 0.9rem; font-weight: 800; color: #fff; flex-shrink: 0;
 }
-.score-pill {
-    display: inline-block; padding: 2px 10px; border-radius: 99px;
-    font-size: 0.78rem; font-weight: 700; margin: 2px 4px 2px 0;
+.score-bar-wrap {
+    display: flex; align-items: center; gap: 10px; padding: 3px 0;
+}
+.score-bar-track {
+    flex: 1; background: #e5e7eb; border-radius: 99px; height: 9px; overflow: hidden;
+}
+.score-bar-fill { height: 9px; border-radius: 99px; }
+.reason-tag {
+    display: inline-block; padding: 3px 10px; margin: 2px 3px 2px 0;
+    border-radius: 99px; font-size: 0.75rem; font-weight: 600;
+    background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0;
+}
+.cat-section {
+    font-size: 1.05rem; font-weight: 800;
+    border-left: 4px solid #15803d; padding-left: 10px;
+    margin: 28px 0 6px 0;
 }
 .matcher-chip {
-    display: inline-block; padding: 1px 7px; background: #dbeafe;
-    color: #1d4ed8; border-radius: 4px; font-size: 0.71rem;
+    display: inline-block; padding: 1px 7px;
+    background: #dbeafe; color: #1d4ed8;
+    border-radius: 4px; font-size: 0.68rem;
     font-weight: 700; font-family: monospace; margin-right: 4px;
-}
-.cat-header {
-    font-size: 1.1rem; font-weight: 800;
-    border-left: 4px solid #15803d;
-    padding-left: 10px; margin: 20px 0 4px 0;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -78,36 +99,35 @@ SC_LABELS = {
     6: "Finance / Investment", 7: "Policy / Regulatory",
 }
 
+CAT_ORDER = [
+    RecommendedCandidate.CATEGORY_PEOPLE,
+    RecommendedCandidate.CATEGORY_COMPANIES,
+    RecommendedCandidate.CATEGORY_INVESTORS,
+]
+
 CAT_ICONS = {
-    RecommendationCategory.PEOPLE:        "👤",
-    RecommendationCategory.COMPANIES:     "🏢",
-    RecommendationCategory.INVESTORS:     "💰",
-    RecommendationCategory.OPPORTUNITIES: "🤝",
+    RecommendedCandidate.CATEGORY_PEOPLE:    "👤",
+    RecommendedCandidate.CATEGORY_COMPANIES: "🏢",
+    RecommendedCandidate.CATEGORY_INVESTORS: "💰",
 }
 
-# Goals exposed in the UI multiselect
-GOAL_UI_OPTIONS: dict[str, str] = {
-    "👤  Meet People":              GoalType.FIND_PEOPLE,
-    "🤝  Find Collaborators":       GoalType.FIND_COLLABORATORS,
-    "🏢  Find Companies & Partners":GoalType.FIND_COMPANIES,
-    "💰  Find Investors":           GoalType.FIND_INVESTORS,
-}
+ALL_CANDIDATES = EVENT_ATTENDEES + ORGANIZATIONS
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
 def _init_state() -> None:
-    if "store"   not in st.session_state:
+    if "store" not in st.session_state:
         st.session_state.store   = InMemoryRelationshipStore()
     if "service" not in st.session_state:
         st.session_state.service = MatchmakingService(st.session_state.store)
-    if "mind"    not in st.session_state:
+    if "mind" not in st.session_state:
         st.session_state.mind    = Mind(st.session_state.store)
     for k, v in {
-        "user_context":   None,
-        "event_context":  None,
-        "categorized":    [],     # list[CategorizedRecommendation]
-        "run_results":    {},     # dict[matcher_id → list[Relationship]]
-        "missing_hints":  [],
+        "user_context":  None,
+        "event_context": None,
+        "candidates":    [],      # list[RecommendedCandidate]
+        "run_results":   {},
+        "hints":         [],
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -119,58 +139,53 @@ ss = st.session_state
 def _csv(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
-def _score_bar(score: float, height: int = 10) -> str:
+def _pool_lookup() -> dict[str, dict]:
+    return {p.get("id", ""): p for p in ALL_CANDIDATES}
+
+def _score_html(score: float) -> str:
     pct   = int(score * 100)
     color = "#16a34a" if score >= 0.70 else "#d97706" if score >= 0.50 else "#dc2626"
-    label = "Strong"  if score >= 0.70 else "Good"    if score >= 0.50 else "Weak"
+    label = "Strong" if score >= 0.70 else "Good" if score >= 0.50 else "Weak"
     return (
-        f'<div style="display:flex;align-items:center;gap:10px;padding:3px 0">'
-        f'<div style="flex:1;background:#e5e7eb;border-radius:99px;height:{height}px;overflow:hidden">'
-        f'<div style="width:{pct}%;background:{color};height:{height}px;border-radius:99px"></div></div>'
-        f'<span style="font-size:0.9rem;font-weight:800;color:{color};min-width:40px">{pct}%</span>'
-        f'<span style="font-size:0.71rem;color:#9ca3af;min-width:44px">{label}</span></div>'
+        f'<div class="score-bar-wrap">'
+        f'<div class="score-bar-track">'
+        f'<div class="score-bar-fill" style="width:{pct}%;background:{color}"></div></div>'
+        f'<span style="font-size:0.9rem;font-weight:800;color:{color};min-width:38px">{pct}%</span>'
+        f'<span style="font-size:0.7rem;color:#9ca3af">{label}</span></div>'
     )
 
-def _rank_badge(rank: int) -> str:
+def _rank_html(rank: int) -> str:
     color = {1: "#f59e0b", 2: "#94a3b8", 3: "#b45309"}.get(rank, "#6366f1")
-    return f'<div class="rank-circle" style="background:{color}">#{rank}</div>'
+    return f'<div class="rank-badge" style="background:{color}">#{rank}</div>'
 
-def _rel_map(results: dict) -> dict:
-    """Flatten run_results → relationship_id: Relationship lookup."""
-    out = {}
-    for rels in results.values():
-        for r in rels:
-            out[r.relationship_id] = r
-    return out
-
-def _meta(cid: str, pools: list[dict]) -> dict:
-    return next((p for p in pools if p.get("id") == cid), {})
-
-def _needs_org_fields(goals: list[str]) -> bool:
-    gt = infer_goal_types(goals)
-    return bool(gt & {GoalType.FIND_COMPANIES, GoalType.FIND_INVESTORS})
+def _reason_pills(reasons: list[str]) -> str:
+    return "".join(
+        f'<span class="reason-tag">✓ {r}</span>' for r in reasons
+    )
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## 🌿 Mosambi")
-    st.caption("Climate-tech event matchmaking")
+    st.caption("Proactive climate-tech matchmaking")
     st.divider()
 
     with st.form("profile_form", border=False):
 
-        # ── Identity ─────────────────────────────────────────────────────────
+        # ── Identity ──────────────────────────────────────────────────────────
         st.markdown("#### 👤 Your Profile")
         name = st.text_input("Your name *", placeholder="e.g. Aarav Kulkarni")
         uid  = st.text_input("Your ID", value="SEEKER-001")
 
-        roles_opts = ["Founder", "Investor", "Researcher", "Policy Lead",
-                      "Engineer", "Corporate Sustainability Director",
-                      "Speaker", "Organiser", "Other"]
-        roles = st.multiselect("Role(s)", roles_opts, default=["Founder"])
-        exp   = st.selectbox("Experience level",
-                             ["Junior", "Mid-level", "Senior", "Executive"], index=2)
+        roles = st.multiselect(
+            "Role(s)", ["Founder", "Investor", "Researcher", "Policy Lead",
+                        "Engineer", "Corporate Sustainability Director",
+                        "Speaker", "Organiser", "Other"],
+            default=["Founder"],
+        )
+        exp = st.selectbox("Experience level",
+                           ["Junior", "Mid-level", "Senior", "Executive"], index=2)
 
         # ── Professional ──────────────────────────────────────────────────────
         st.markdown("**Professional background**")
@@ -181,66 +196,51 @@ with st.sidebar:
         interests = st.text_input("Interests",
                                   placeholder="battery technology, climate finance")
 
-        # ── Goals ─────────────────────────────────────────────────────────────
-        st.markdown("**What I'm looking for**")
-        goal_labels = st.multiselect(
-            "Select your goals",
-            options=list(GOAL_UI_OPTIONS.keys()),
-            default=["👤  Meet People", "💰  Find Investors"],
-            help="Mind will invoke only the relevant matchers for your goals.",
-        )
-
-        # ── Event context ─────────────────────────────────────────────────────
+        # ── Event ─────────────────────────────────────────────────────────────
         st.markdown("**Event context**")
-        event_id     = st.text_input("Event ID", value="EVENT-2026",
-                                     help="Leave blank to skip event-attendee matching")
+        event_id     = st.text_input("Event ID", value="EVENT-2026")
         event_themes = st.text_input("Event themes",
-                                     placeholder="clean energy, climate finance",
-                                     help="Optional — enriches event-interest signal")
+                                     placeholder="clean energy, climate finance")
 
-        # ── Org-specific extras ───────────────────────────────────────────────
-        with st.expander("🏢 Organization / investor details"):
-            st.caption("Fill this section when looking for companies or investors.")
-            s_type  = st.selectbox("Stakeholder type",
-                                   ["Attendee", "Investor", "Sponsor", "Partner",
-                                    "Speaker", "Press / Media", "Organiser"])
+        # ── Organization details ──────────────────────────────────────────────
+        with st.expander("🏢 Organization details"):
+            st.caption("Complete this section to improve organization & investor matching.")
+            s_type  = st.selectbox(
+                "Stakeholder type",
+                ["Attendee", "Investor", "Sponsor", "Partner",
+                 "Speaker", "Press / Media", "Organiser"])
             col_c, col_n = st.columns(2)
             with col_c:
                 city    = st.text_input("City", placeholder="Mumbai")
             with col_n:
                 country = st.text_input("Country", placeholder="India")
-            op_ctry = st.text_input("Operating countries",
-                                    placeholder="India, Singapore")
+            op_ctry   = st.text_input("Operating countries",
+                                      placeholder="India, Singapore")
             sc_stages = st.multiselect(
                 "Supply chain stage(s)",
                 options=list(SC_LABELS.keys()),
                 format_func=lambda x: f"{x} · {SC_LABELS[x]}",
             )
-            org_stage    = st.text_input("Lifecycle stage",
-                                         placeholder="Seed / Series A / Growth")
-            fund_on      = st.checkbox("Actively fundraising")
-            fund_amount  = None
+            org_stage = st.text_input("Lifecycle stage",
+                                      placeholder="Seed / Series A / Growth")
+            fund_on   = st.checkbox("Actively fundraising")
+            fund_amt  = None
             if fund_on:
-                fund_amount = st.number_input(
+                fund_amt = st.number_input(
                     "Fundraising ask (USD)", min_value=0,
                     value=1_000_000, step=100_000, format="%d",
                 )
-            sdg = st.multiselect("UN SDG Goals",
-                                 [f"SDG {i}" for i in range(1, 18)])
+            sdg = st.multiselect("UN SDG Goals", [f"SDG {i}" for i in range(1, 18)])
 
         # ── Submit ────────────────────────────────────────────────────────────
         submitted = st.form_submit_button(
-            "🧠  Find My Matches", type="primary", use_container_width=True
+            "🧠  Get My Recommendations", type="primary", use_container_width=True
         )
 
     if submitted:
         if not name.strip():
             st.error("Please enter your name.")
-        elif not goal_labels:
-            st.error("Please select at least one goal.")
         else:
-            selected_goals = [GOAL_UI_OPTIONS[l] for l in goal_labels]
-
             user_ctx = UserContext(
                 user_id=uid.strip() or "SEEKER-001",
                 name=name.strip(),
@@ -249,20 +249,19 @@ with st.sidebar:
                 domains=_csv(domains),
                 skills=_csv(skills),
                 interests=_csv(interests),
-                goals=selected_goals,
+                goals=[],   # proactive mode — no user-stated goals
                 extra={
-                    "stakeholder_type": s_type,
-                    "city":             city.strip() or None,
-                    "country":          country.strip() or None,
+                    "stakeholder_type":    s_type,
+                    "city":                city.strip() or None,
+                    "country":             country.strip() or None,
                     "operating_countries": _csv(op_ctry),
                     "supply_chain_stage":  sc_stages,
-                    "stage":            org_stage.strip() or None,
+                    "stage":               org_stage.strip() or None,
                     "fundraising_toggle":  fund_on,
-                    "fundraising_amount":  fund_amount,
-                    "sdg_goals":        sdg,
+                    "fundraising_amount":  fund_amt,
+                    "sdg_goals":           sdg,
                 },
             )
-
             event_ctx = None
             if event_id.strip():
                 event_ctx = EventContext(
@@ -270,23 +269,28 @@ with st.sidebar:
                     themes=_csv(event_themes),
                 )
 
-            with st.spinner("🧠 Mind is planning your recommendations…"):
+            with st.spinner("🧠 Discovering your recommendations…"):
                 run_results = ss.service.run_for_user(
                     user_ctx, event_ctx,
-                    people_pool=EVENT_ATTENDEES,
-                    org_pool=ORGANIZATIONS,
+                    people_pool=EVENT_ATTENDEES, org_pool=ORGANIZATIONS,
                 )
-                cats = ss.mind.recommend_for_user(user_ctx, event_ctx, top_n=6)
-                hints = missing_fields(user_ctx, infer_goal_types(selected_goals))
+                candidates = ss.mind.recommend_for_user(
+                    user_ctx, event_ctx,
+                    candidate_pool=ALL_CANDIDATES, top_n=12,
+                )
+                # Internal goal inference for profile hints only (not shown as UI selection)
+                internal_goals = infer_goal_types(user_ctx.roles + user_ctx.domains)
+                hints = missing_fields(user_ctx, internal_goals)
 
             ss.user_context  = user_ctx
             ss.event_context = event_ctx
-            ss.categorized   = cats
+            ss.candidates    = candidates
             ss.run_results   = run_results
-            ss.missing_hints = hints
+            ss.hints         = hints
 
-            total = sum(len(c.items) for c in cats)
-            st.success(f"✅  {total} recommendation{'s' if total != 1 else ''} across {len(cats)} categor{'ies' if len(cats) != 1 else 'y'}")
+            st.success(
+                f"✅  {len(candidates)} recommendation{'s' if len(candidates) != 1 else ''} found"
+            )
 
     st.divider()
     if st.button("🔄  Reset session", use_container_width=True):
@@ -298,134 +302,124 @@ with st.sidebar:
 
 # ── MAIN TABS ─────────────────────────────────────────────────────────────────
 
-tab_mind, tab_profile, tab_backend = st.tabs(
-    ["🧠  Mind", "👤  My Profile", "⚙️  Backend"]
+tab_reco, tab_profile, tab_backend = st.tabs(
+    ["🌿  Recommended for You", "👤  My Profile", "⚙️  Backend"]
 )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — MIND RECOMMENDATIONS
+# TAB 1 — RECOMMENDED FOR YOU
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_mind:
+with tab_reco:
 
-    # ── Welcome state ─────────────────────────────────────────────────────────
     if not ss.user_context:
-        st.markdown("## 🌿 Welcome to Mosambi Mind")
+        # ── Welcome / empty state ─────────────────────────────────────────────
+        st.markdown("## 🌿 Welcome to Mosambi")
         st.write(
-            "Fill in your profile once in the sidebar and click **Find My Matches**. "
-            "Mind will decide which matchers are relevant for your goals and return "
-            "categorized, explained recommendations — no separate questionnaires per matcher."
+            "Fill in your profile in the sidebar and click **Get My Recommendations**. "
+            "Mosambi will automatically discover people, organizations, and investors "
+            "that are relevant to who you are and the event you are attending — "
+            "no goal selection required."
         )
         st.divider()
         c1, c2, c3 = st.columns(3)
-        with c1:
-            with st.container(border=True):
-                st.markdown("**1 · Enter your profile once**")
-                st.caption("Name, roles, domains, skills, interests — shared across all matchers.")
-        with c2:
-            with st.container(border=True):
-                st.markdown("**2 · Choose your goals**")
-                st.caption("Find People · Find Investors · Find Companies · Find Collaborators")
-        with c3:
-            with st.container(border=True):
-                st.markdown("**3 · Mind does the rest**")
-                st.caption("Categorized recommendations: 👤 People · 🏢 Companies · 💰 Investors")
+        for col, icon, title, desc in [
+            (c1, "1️⃣", "Enter your profile once",
+             "Name, role, domain, skills, interests — shared across all matching capabilities."),
+            (c2, "2️⃣", "Select an event",
+             "The event provides context. Mosambi uses it to understand who else is in the room."),
+            (c3, "3️⃣", "Explore your recommendations",
+             "People · Organizations · Investors — proactively surfaced, fully explained."),
+        ]:
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"**{icon} {title}**")
+                    st.caption(desc)
         st.stop()
 
-    if not ss.categorized:
+    if not ss.candidates:
         st.warning(
-            "No matches found above the minimum threshold for your current goals. "
-            "Try broadening your domains, interests, or adding more goals."
+            "No recommendations found above the minimum threshold. "
+            "Try completing your organization details (country, domains, supply chain stage)."
         )
         st.stop()
 
     # ── Header ────────────────────────────────────────────────────────────────
     uc = ss.user_context
     ec = ss.event_context
-    st.markdown(f"## Recommendations for **{uc.name}**")
-
-    goal_text = ", ".join(GOAL_LABELS.get(g, g) for g in uc.goals)
-    ev_text   = f"  ·  Event `{ec.event_id}`" if ec else ""
+    ev_text = f"  ·  Event `{ec.event_id}`" if ec else ""
+    st.markdown(f"## Recommended for **{uc.name}**")
     st.caption(
-        f"Goals: {goal_text}{ev_text}  ·  "
-        f"{sum(len(c.items) for c in ss.categorized)} total matches"
+        f"{len(ss.candidates)} recommendations{ev_text}  ·  "
+        f"Profile: {', '.join(uc.roles)}  ·  {', '.join(uc.domains[:2]) or 'No domains set'}"
     )
-    if ss.missing_hints:
-        with st.expander("💡 Optional profile improvements"):
-            st.caption("Filling these fields would improve your match quality:")
-            for hint in ss.missing_hints:
+
+    if ss.hints:
+        with st.expander("💡 Improve your matches"):
+            st.caption("Adding these details would improve match quality:")
+            for hint in ss.hints:
                 st.markdown(f"- {hint}")
 
-    st.divider()
+    # ── Group candidates by category ──────────────────────────────────────────
+    by_cat: dict[str, list[RecommendedCandidate]] = defaultdict(list)
+    for c in ss.candidates:
+        by_cat[c.category].append(c)
 
-    all_pools = EVENT_ATTENDEES + ORGANIZATIONS
-    lookup    = _rel_map(ss.run_results)
+    for cat in CAT_ORDER:
+        items = by_cat.get(cat)
+        if not items:
+            continue
 
-    # ── Categorized recommendation sections ───────────────────────────────────
-    for cat in ss.categorized:
-        icon = CAT_ICONS.get(cat.category, "📌")
-
+        icon = CAT_ICONS.get(cat, "📌")
         st.markdown(
-            f'<div class="cat-header">{icon}  {cat.category.value}</div>',
+            f'<div class="cat-section">{icon}&nbsp; {cat}</div>',
             unsafe_allow_html=True,
         )
-        st.caption(f"_{cat.rationale}_  ·  matcher `{cat.matcher_id}`")
 
-        for rank_i, rec in enumerate(cat.items, start=1):
-            m     = _meta(rec.candidate.id, all_pools)
-            name  = m.get("name", rec.candidate.id)
-            role  = m.get("role") or m.get("stakeholder_type", "")
-
-            # Pull signals from the strongest relationship
-            signals: dict = {}
-            for rid in rec.relationship_ids:
-                if rid in lookup:
-                    signals = lookup[rid].signals
-                    break
-
-            top3 = sorted(signals.items(), key=lambda x: x[1], reverse=True)[:3]
+        global_rank = 0
+        for cand in items:
+            global_rank += 1
 
             with st.container(border=True):
-                col_badge, col_name, col_bar = st.columns([1, 5, 4])
+                col_badge, col_info, col_score = st.columns([1, 5, 3])
 
                 with col_badge:
-                    st.markdown(_rank_badge(rank_i), unsafe_allow_html=True)
+                    st.markdown(_rank_html(global_rank), unsafe_allow_html=True)
 
-                with col_name:
-                    st.markdown(f"### {name}")
-                    if role:
-                        st.caption(role)
+                with col_info:
+                    st.markdown(f"### {cand.candidate_name}")
+                    # Matcher provenance chips
                     chips = " ".join(
-                        f'<span class="matcher-chip">{mid}</span>'
-                        for mid in rec.matcher_ids
+                        f'<span class="matcher-chip">{m}</span>'
+                        for m in cand.source_matchers
                     )
                     st.markdown(chips, unsafe_allow_html=True)
 
-                with col_bar:
+                with col_score:
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.markdown(_score_bar(rec.score), unsafe_allow_html=True)
+                    st.markdown(_score_html(cand.relevance_score), unsafe_allow_html=True)
 
-                # Signal pills
-                if top3:
-                    pills = ""
-                    for sname, sval in top3:
-                        if sval >= 0.70:
-                            bg, fg = "#dcfce7", "#15803d"
-                        elif sval >= 0.40:
-                            bg, fg = "#fef9c3", "#92400e"
-                        else:
-                            bg, fg = "#f1f5f9", "#64748b"
-                        label = sname.replace("_", " ").title()
-                        pills += (
-                            f'<span class="score-pill" '
-                            f'style="background:{bg};color:{fg};border:1px solid {fg}22">'
-                            f'{label}: {sval:.0%}</span>'
-                        )
-                    st.markdown(pills, unsafe_allow_html=True)
+                # "Why am I seeing this?" reason tags
+                if cand.reasons:
+                    st.markdown(
+                        _reason_pills(cand.reasons),
+                        unsafe_allow_html=True,
+                    )
 
-                with st.expander("Full score breakdown"):
-                    if signals:
-                        st.table([
+                # Expandable detail
+                with st.expander("Signal breakdown & evidence"):
+                    # All signals across all evidence
+                    all_signals: dict[str, float] = {}
+                    for ev in cand.evidence:
+                        for k, v in ev.signals.items():
+                            try:
+                                all_signals[k] = max(all_signals.get(k, 0.0), float(v))
+                            except (TypeError, ValueError):
+                                pass
+
+                    if all_signals:
+                        rows = [
                             {
                                 "Signal": k.replace("_", " ").title(),
                                 "Score":  f"{v:.1%}",
@@ -435,15 +429,17 @@ with tab_mind:
                                     else "⚫ Weak"
                                 ),
                             }
-                            for k, v in sorted(signals.items(),
+                            for k, v in sorted(all_signals.items(),
                                                key=lambda x: x[1], reverse=True)
-                        ])
-                    else:
-                        st.caption("No signal breakdown available.")
-                    st.caption(
-                        f"Relationship: `{'`, `'.join(rec.relationship_ids)}`  \n"
-                        f"Reasons: {', '.join(rec.reasons) or '—'}"
-                    )
+                        ]
+                        st.table(rows)
+
+                    # Evidence per matcher
+                    for ev in cand.evidence:
+                        st.caption(
+                            f"`{ev.matcher_id}` — score: {ev.score:.1%}  ·  "
+                            f"rel: `{ev.relationship_id[:20]}…`"
+                        )
 
         st.markdown("")
 
@@ -466,32 +462,36 @@ with tab_profile:
 
     col_l, col_r = st.columns(2)
     with col_l:
-        st.markdown("**Roles**");         st.write(", ".join(uc.roles) or "—")
-        st.markdown("**Experience**");    st.write(uc.experience_level or "—")
-        st.markdown("**Domains**");       st.write(", ".join(uc.domains) or "—")
-        st.markdown("**Skills**");        st.write(", ".join(uc.skills) or "—")
-        st.markdown("**Interests**");     st.write(", ".join(uc.interests) or "—")
+        for label, value in [
+            ("Roles",      ", ".join(uc.roles) or "—"),
+            ("Experience", uc.experience_level or "—"),
+            ("Domains",    ", ".join(uc.domains) or "—"),
+            ("Skills",     ", ".join(uc.skills) or "—"),
+            ("Interests",  ", ".join(uc.interests) or "—"),
+        ]:
+            st.markdown(f"**{label}**")
+            st.write(value)
+
     with col_r:
-        st.markdown("**Goals**")
-        for g in uc.goals:
-            st.write(f"• {GOAL_LABELS.get(g, g)}")
         st.markdown("**Event**")
         if ec:
-            st.write(f"`{ec.event_id}` — {ec.name or 'unnamed'}")
+            st.write(f"`{ec.event_id}`")
             if ec.themes:
                 st.caption(f"Themes: {', '.join(ec.themes)}")
         else:
-            st.write("No event context")
-        if uc.extra.get("country"):
-            st.markdown("**Country**"); st.write(uc.extra["country"])
+            st.write("No event selected")
 
-    # Org extras summary (collapsed by default)
+        if uc.extra.get("country"):
+            st.markdown("**Country**")
+            st.write(uc.extra["country"])
+
+        st.markdown("**Recommendation mode**")
+        st.write("🤖 Proactive — system discovers opportunities from your profile")
+
+    # Org extras summary
     x = uc.extra
-    org_filled = any([
-        x.get("stakeholder_type"), x.get("supply_chain_stage"),
-        x.get("fundraising_toggle"), x.get("sdg_goals"),
-    ])
-    if org_filled:
+    if any([x.get("stakeholder_type"), x.get("supply_chain_stage"),
+            x.get("fundraising_toggle"), x.get("sdg_goals")]):
         with st.expander("Organization details"):
             c1, c2 = st.columns(2)
             with c1:
@@ -505,7 +505,7 @@ with tab_profile:
                 st.markdown("**Fundraising**")
                 if x.get("fundraising_toggle"):
                     amt = x.get("fundraising_amount") or 0
-                    st.write(f"Yes — ${amt:,.0f}")
+                    st.write(f"Yes — \${amt:,.0f}")
                 else:
                     st.write("Not actively fundraising")
                 st.markdown("**SDG Goals**")
@@ -513,24 +513,20 @@ with tab_profile:
 
     st.divider()
 
-    # Metrics
     mc1, mc2, mc3 = st.columns(3)
     user_rels = ss.store.get_for_entity("USER", uc.user_id)
     org_rels  = ss.store.get_for_entity("ORGANIZATION", uc.user_id)
-    mc1.metric("People relationships", len(user_rels))
-    mc2.metric("Org relationships", len(org_rels))
-    mc3.metric("Matchers run", len(ss.run_results))
+    mc1.metric("People scored", len(user_rels))
+    mc2.metric("Orgs scored", len(org_rels))
+    mc3.metric("Recommendations surfaced", len(ss.candidates))
 
-    # Missing fields hints
-    if ss.missing_hints:
+    if ss.hints:
         st.divider()
-        st.markdown("**💡 Optional profile improvements**")
-        st.caption("Filling these fields would improve match quality for your current goals:")
-        for hint in ss.missing_hints:
+        st.markdown("**💡 Profile improvements**")
+        for hint in ss.hints:
             st.markdown(f"- {hint}")
-    else:
-        if ss.user_context:
-            st.success("✅ Your profile is complete for your selected goals.")
+    elif ss.user_context:
+        st.success("✅ Your profile is complete for the current matching context.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -539,15 +535,14 @@ with tab_profile:
 
 with tab_backend:
     st.markdown("## ⚙️  Backend")
-    st.caption("Internal state — not shown to end users in production.")
+    st.caption("Internal state — for development visibility only.")
 
-    b1, b2, b3 = st.tabs(["Relationship Store", "Last Run", "Architecture"])
+    b1, b2, b3 = st.tabs(["Relationship Store", "Scoring Breakdown", "Architecture"])
 
     # ── Relationship Store ────────────────────────────────────────────────────
     with b1:
         all_rels = list(ss.store._relationships.values())
         st.markdown(f"### {len(all_rels)} relationship(s) in store")
-
         if not all_rels:
             st.info("Run a match from the sidebar first.")
         else:
@@ -559,124 +554,102 @@ with tab_backend:
                         "Source":   f"{r.source.type}:{r.source.id}",
                         "Target":   f"{r.target.type}:{r.target.id}",
                         "Score":    round(r.score, 4),
-                        "Context":  ", ".join(
-                            f"{k}={v}" for k, v in r.context.items()
-                            if k not in ("minimum_score", "score_detail")
-                        ) or "—",
-                        "Rel ID":   r.relationship_id[:18] + "…",
+                        "Rel ID":   r.relationship_id[:20] + "…",
                     }
                     for r in sorted(all_rels, key=lambda r: r.score, reverse=True)
                 ],
                 use_container_width=True, hide_index=True,
             )
 
-            st.markdown("### Inspect a relationship")
-            opts    = {r.relationship_id: f"{r.matcher_id} · {r.source.id} → {r.target.id} · {r.score:.1%}"
-                       for r in all_rels}
-            chosen_id = st.selectbox("Select", list(opts), format_func=lambda x: opts[x])
-            chosen    = ss.store._relationships.get(chosen_id)
-            if chosen:
-                st.json({
-                    "relationship_id": chosen.relationship_id,
-                    "matcher_id":      chosen.matcher_id,
-                    "source": {"type": chosen.source.type, "id": chosen.source.id},
-                    "target": {"type": chosen.target.type, "id": chosen.target.id},
-                    "score":  chosen.score, "signals": chosen.signals,
-                    "context": {k: v for k, v in chosen.context.items()
-                                if k != "score_detail"},
-                })
-
-    # ── Last Run ──────────────────────────────────────────────────────────────
+    # ── Scoring Breakdown ─────────────────────────────────────────────────────
     with b2:
-        st.markdown("### Per-matcher · per-candidate breakdown")
         if not ss.run_results:
             st.info("Run a match from the sidebar first.")
         else:
             uc = ss.user_context
-            all_pools = EVENT_ATTENDEES + ORGANIZATIONS
-
+            pool_map = _pool_lookup()
             for matcher_id, rels in ss.run_results.items():
                 st.markdown(f"#### `{matcher_id}` — {len(rels)} candidates scored")
                 seeker_id = uc.user_id if uc else ""
-
                 for rel in rels:
                     tid   = rel.target.id if rel.source.id == seeker_id else rel.source.id
-                    m     = _meta(tid, all_pools)
-                    cname = m.get("name", tid)
-
+                    cname = pool_map.get(tid, {}).get("name", tid)
                     with st.expander(f"{cname}  —  {rel.score:.1%}"):
-                        el, er = st.columns([3, 2])
-                        with el:
-                            st.markdown("**Signals**")
-                            for sig, val in sorted(
-                                rel.signals.items(), key=lambda x: x[1], reverse=True
-                            ):
-                                st.caption(sig.replace("_", " ").title())
-                                st.markdown(_score_bar(val, height=8),
-                                            unsafe_allow_html=True)
-                        with er:
-                            st.json({
-                                "score":   rel.score,
-                                "matcher": rel.matcher_id,
-                                "rel_id":  rel.relationship_id[:20] + "…",
-                            })
+                        if rel.signals:
+                            st.table([
+                                {
+                                    "Signal": k.replace("_", " ").title(),
+                                    "Score":  f"{v:.1%}",
+                                }
+                                for k, v in sorted(
+                                    rel.signals.items(), key=lambda x: x[1], reverse=True
+                                )
+                            ])
+                        st.caption(f"Rel ID: `{rel.relationship_id[:24]}…`")
 
     # ── Architecture ──────────────────────────────────────────────────────────
     with b3:
-        st.markdown("### Mind orchestration flow")
+        st.markdown("### Proactive recommendation flow")
         st.code("""
-UserContext (enter once)
+UserContext (enter once — no goal selection)
         │
         ▼
-Mind.plan()                 ← Phase A: goal-aware routing
-  ├── infer_goal_types()    ← keyword → GoalType constant
-  └── get_matchers_for_goals()  ← MATCHER_CAPABILITIES routing table
+Mind.plan()                         ← profile-driven, context-aware
+  └── get_all_matchers_for_context()
+        │  Returns every matcher whose context requirements are met.
+        │  No user-stated goals required.
         │
         ▼
 service.run_for_user()
-  ├── to_event_profile()    ← UserContext → MM-EVENT-001 dict
-  ├── to_org_profile()      ← UserContext → MM-ORG-001 dict
-  └── rank_pool()           ← calls each matcher, upserts to store
+  ├── to_event_profile()  → MM-EVENT-001  (if event provided)
+  ├── to_org_profile()    → MM-ORG-001    (always)
+  └── rank_pool()         → upserts to RelationshipStore
         │
         ▼
-RelationshipStore  (InMemoryRelationshipStore — Phase 1)
+RelationshipStore  (evidence / memory)
         │
         ▼
-Mind.recommend_for_user()   ← Phase B: categorized synthesis
-  ├── reads store via existing recommend()
-  ├── groups by matcher → RecommendationCategory
-  └── NEVER blends scores across matcher types
+Mind.recommend_for_user()
+  └── RecommendationEngine.build()
+        ├── Collect evidence per unique candidate
+        ├── Deduplicate (same candidate from multiple matchers → merge)
+        ├── Categorize from candidate metadata (stakeholder_type)
+        │     USER       → "People you may want to meet"
+        │     Investor   → "Potential investors"
+        │     Other Org  → "Organizations worth exploring"
+        ├── Explain from actual signal scores (no hallucination)
+        └── relevance_score = max(evidence.score)  ← never blended
         │
         ▼
-list[CategorizedRecommendation]
-  ├── 👤 People   (MM-EVENT-001)
-  ├── 🏢 Companies (MM-ORG-001)
-  └── ... future matchers added via MATCHER_CAPABILITIES only
+list[RecommendedCandidate]
+  ├── 👤 People you may want to meet
+  ├── 🏢 Organizations worth exploring
+  └── 💰 Potential investors
         """, language="text")
 
-        st.markdown("### MATCHER_CAPABILITIES routing table")
+        st.markdown("### MATCHER_CAPABILITIES")
         from registry import MATCHER_CAPABILITIES
         st.json({
             mid: {
-                "goal_types":         list(cap.goal_types),
+                "capabilities":       list(cap.capabilities),
                 "seeker_entity_type": cap.seeker_entity_type,
-                "category":           cap.category.value,
                 "needs_event_context":cap.needs_event_context,
             }
             for mid, cap in MATCHER_CAPABILITIES.items()
         })
 
-        st.markdown("### Phase-1 limitations")
+        st.markdown("### Phase-1 architectural notes")
         for title, desc in [
+            ("Profile-driven routing",
+             "plan() invokes all registered matchers whose context requirements are met. "
+             "No user goal selection. LLM seam: replace get_all_matchers_for_context() body."),
+            ("networking_objective",
+             "Derived from roles+domains — who the user IS. No hard-coded role→goal rules. "
+             "The EventMatchmaker's Jaccard scorer determines compatibility from these signals."),
+            ("Score non-blending",
+             "relevance_score = max(evidence.score). Matcher provenance always preserved. "
+             "Scores from MM-EVENT-001 and MM-ORG-001 are never averaged together."),
             ("In-memory store",
-             "Relationships reset on page hard-refresh. Phase 2 replaces with PostgreSQL."),
-            ("Keyword goal routing",
-             "infer_goal_types() uses keyword stems. Phase 4 will add LLM-based routing "
-             "via the plan() seam — no other code changes required."),
-            ("O(n) scoring",
-             "Seeker is scored against every candidate. Phase 3 adds vector pre-filtering."),
-            ("Scores not blended across categories",
-             "This is a deliberate design choice, not a limitation. Each category's "
-             "score comes from exactly one matcher to preserve provenance."),
+             "Relationships reset on page refresh. Phase 2 replaces with PostgreSQL."),
         ]:
-            st.warning(f"**{title}:** {desc}")
+            st.info(f"**{title}**: {desc}")

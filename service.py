@@ -2,11 +2,11 @@
 service.py — Matchmaking service layer.
 
 Preserves the existing run_pair() and rank_pool() methods unchanged.
-Adds run_for_user() which orchestrates the full scoring pass for a UserContext:
-  1. Asks Mind.plan() which matchers are relevant.
-  2. Converts UserContext → matcher-specific profile dicts via adapters.
-  3. Calls rank_pool() for each relevant matcher (matchers unchanged).
-  4. Returns results keyed by matcher_id.
+
+run_for_user() is now profile-driven — it does NOT require user-stated goals.
+It invokes every registered matcher whose context requirements are satisfied,
+converts UserContext → matcher-specific dicts via adapters, and persists
+relationships to the store.
 
 The matchers never see UserContext. The adapters are the only translation layer.
 """
@@ -55,43 +55,33 @@ class MatchmakingService:
 
     def run_for_user(
         self,
-        user_context,                    # core.context.UserContext
-        event_context=None,              # core.context.EventContext | None
+        user_context,                       # core.context.UserContext
+        event_context=None,                 # core.context.EventContext | None
         *,
         people_pool: list[dict] | None = None,
         org_pool:    list[dict] | None = None,
     ) -> dict[str, list]:
-        """Orchestrate the full scoring pass for a canonical UserContext.
+        """Orchestrate a full scoring pass for a canonical UserContext.
+
+        Profile-driven — does NOT require user-stated goals.
+        Invokes every registered matcher whose context requirements are met.
 
         Steps:
-          1. Infers goal types from user_context.goals.
-          2. Asks the capability registry which matchers are relevant.
-          3. Converts UserContext → the profile dict each matcher expects
-             (using adapters from core.context — matchers never see UserContext).
-          4. Calls rank_pool() for each relevant matcher.
-          5. Returns {matcher_id: sorted_relationship_list}.
+          1. get_all_matchers_for_context() — context-driven capability selection.
+          2. For each matched matcher, convert UserContext → matcher-specific dict
+             via the appropriate adapter (matchers never see UserContext).
+          3. Call rank_pool() → persists relationships to the store.
+          4. Return {matcher_id: sorted_relationship_list}.
 
-        The user's profile information is reused across all matchers — it is
-        never reconstructed or re-prompted.
+        The user's profile is reused across all matchers — never re-prompted.
+        Adding a new matcher requires only a new branch in this method
+        (and an entry in MATCHER_CAPABILITIES).
         """
-        from core.context import (
-            infer_goal_types,
-            to_event_profile,
-            to_org_profile,
-        )
-        from registry import MATCHER_CAPABILITIES, get_matchers_for_goals
-        from mind.mind import Mind
+        from core.context import to_event_profile, to_org_profile
+        from registry import MATCHER_CAPABILITIES, get_all_matchers_for_context
 
-        goal_types  = infer_goal_types(user_context.goals)
-        matched_ids = get_matchers_for_goals(goal_types)
-
-        # Respect event context requirement
-        if event_context is None:
-            matched_ids = [
-                mid for mid in matched_ids
-                if not MATCHER_CAPABILITIES[mid].needs_event_context
-            ]
-
+        # Context-driven selection — no goal filtering
+        matched_ids = get_all_matchers_for_context(event_context)
         results: dict[str, list] = {}
 
         for matcher_id in matched_ids:
@@ -109,6 +99,7 @@ class MatchmakingService:
 
             else:
                 # Future matchers: add their profile adapter branch here.
+                # The rest of Mind, the store, and the UI do not need to change.
                 continue
 
             if pool:

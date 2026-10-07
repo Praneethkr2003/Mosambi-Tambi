@@ -168,10 +168,18 @@ def to_event_profile(
         professional_domain  ← ctx.domains
         interests            ← ctx.interests
         role                 ← ctx.roles[0]  (primary role)
-        networking_objective ← ctx.goals
+        networking_objective ← ctx.roles + ctx.domains  (who the user IS)
         skills               ← ctx.skills
         experience_level     ← ctx.experience_level
         event_interest       ← event_ctx.themes + top ctx.interests
+
+    networking_objective is derived from roles and domains rather than
+    user-stated goals. This means:
+      - It carries signal even when goals=[] (proactive mode).
+      - It reflects what the user DOES, not what they SAY they want.
+      - The EventMatchmaker's Jaccard scorer handles the rest.
+    These are signals, not rules — the scorer determines compatibility.
+    No hard-coded role→goal mappings are applied here.
     """
     # Seed event_interest from event themes; supplement with user interests
     event_interest: list[str] = list(event_ctx.themes) if event_ctx else []
@@ -179,13 +187,17 @@ def to_event_profile(
         if interest not in event_interest:
             event_interest.append(interest)
 
+    # networking_objective: signal about who this person is.
+    # Roles and domains carry identity signal without asserting intent.
+    networking_objective = list(ctx.roles) + list(ctx.domains)
+
     return {
         "id":                   ctx.user_id,
         "name":                 ctx.name,
         "professional_domain":  ctx.domains,
         "interests":            ctx.interests,
         "role":                 ctx.roles[0] if ctx.roles else "Other",
-        "networking_objective": ctx.goals,
+        "networking_objective": networking_objective,
         "skills":               ctx.skills,
         "experience_level":     ctx.experience_level or "Mid-level",
         "event_interest":       event_interest,
