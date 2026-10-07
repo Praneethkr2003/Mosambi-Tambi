@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pandas as pd
 import streamlit as st
 
 from core.context import (
@@ -128,6 +129,7 @@ def _init_state() -> None:
         "candidates":    [],      # list[RecommendedCandidate]
         "run_results":   {},
         "hints":         [],
+        "prefill_data":  {},      # dict populated by Excel uploader
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -164,6 +166,86 @@ def _reason_pills(reasons: list[str]) -> str:
     )
 
 
+# ── Excel / Demo Mode helpers ─────────────────────────────────────────────────
+
+# Flexible column name aliases — tries each name in order, first non-blank wins.
+_COL_ALIASES: dict[str, list[str]] = {
+    "name":               ["name", "Name", "full_name", "Full Name", "attendee_name", "Attendee"],
+    "user_id":            ["id", "ID", "user_id", "User ID", "attendee_id", "Attendee ID"],
+    "roles":              ["role", "roles", "Role", "Roles", "role(s)", "Role(s)", "designation"],
+    "experience_level":   ["experience_level", "experience", "Experience", "Experience Level", "seniority", "Seniority"],
+    "domains":            ["domains", "domain", "Domain", "Domains", "climate_domain",
+                           "Climate Domain", "professional_domain", "Professional Domain"],
+    "skills":             ["skills", "Skills", "skill", "Skill", "expertise", "Expertise"],
+    "interests":          ["interests", "Interests", "interest", "Interest", "focus_areas"],
+    "stakeholder_type":   ["stakeholder_type", "Stakeholder Type", "stakeholder", "Stakeholder", "type", "Type"],
+    "country":            ["country", "Country", "hq_country", "HQ Country"],
+    "city":               ["city", "City", "hq_city", "HQ City"],
+    "operating_countries":["operating_countries", "Operating Countries", "countries", "Countries"],
+    "supply_chain_stage": ["supply_chain_stage", "Supply Chain Stage", "supply_chain", "sc_stage", "SC Stage"],
+    "stage":              ["stage", "Stage", "lifecycle_stage", "Lifecycle Stage", "org_stage", "Company Stage"],
+    "fundraising_toggle": ["fundraising_toggle", "fundraising", "Fundraising", "is_fundraising", "raising", "Raising"],
+    "fundraising_amount": ["fundraising_amount", "Fundraising Amount", "ask", "Ask", "raise", "Raise", "target_raise"],
+    "sdg_goals":          ["sdg_goals", "SDG Goals", "sdg", "SDG", "un_goals", "UN Goals"],
+    "event_id":           ["event_id", "Event ID", "event", "Event"],
+    "event_themes":       ["event_themes", "Event Themes", "themes", "Themes"],
+}
+
+
+def _excel_str(row: dict, field: str, default: str = "") -> str:
+    """Return the first non-blank value for a field from its column aliases."""
+    for col in _COL_ALIASES.get(field, [field]):
+        v = row.get(col)
+        if v is not None and str(v).strip() and str(v).strip().lower() != "nan":
+            return str(v).strip()
+    return default
+
+
+def _excel_list(row: dict, field: str) -> list[str]:
+    """Return a list by splitting the first non-blank value for a field."""
+    raw = _excel_str(row, field)
+    if not raw:
+        return []
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+def _excel_bool(row: dict, field: str) -> bool:
+    """Parse truthy Excel values (Yes / True / 1 / ✓) as True."""
+    raw = _excel_str(row, field).lower()
+    return raw in ("yes", "true", "1", "✓", "x", "on")
+
+
+def _excel_int(row: dict, field: str, default: int = 0) -> int:
+    try:
+        return int(float(_excel_str(row, field, str(default))))
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_excel(uploaded_file) -> pd.DataFrame | None:
+    """Read .xlsx / .xls / .csv upload into a DataFrame. Returns None on error."""
+    try:
+        name_lower = uploaded_file.name.lower()
+        if name_lower.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        # Normalise column names — strip whitespace
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+    except Exception as e:
+        st.error(f"Could not parse file: {e}")
+        return None
+
+
+def _find_name_column(df: pd.DataFrame) -> str | None:
+    """Find whichever column holds the attendee name."""
+    for alias in _COL_ALIASES["name"]:
+        if alias in df.columns:
+            return alias
+    return df.columns[0] if len(df.columns) > 0 else None
+
+
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -171,66 +253,151 @@ with st.sidebar:
     st.caption("Proactive climate-tech matchmaking")
     st.divider()
 
+    # ── Demo Mode — Excel Upload ───────────────────────────────────────────────
+    with st.expander("📂 Demo Mode — Load from Excel", expanded=False):
+        st.caption(
+            "Upload an attendee list (.xlsx / .csv). "
+            "Select a name and click **Fill Profile** to auto-populate the form below."
+        )
+        uploaded = st.file_uploader(
+            "Attendee list", type=["xlsx", "xls", "csv"],
+            label_visibility="collapsed",
+        )
+
+        if uploaded is not None:
+            df_excel = _parse_excel(uploaded)
+            if df_excel is not None and len(df_excel) > 0:
+                name_col = _find_name_column(df_excel)
+                if name_col:
+                    names_in_sheet = df_excel[name_col].astype(str).tolist()
+                    chosen_name = st.selectbox(
+                        "Select attendee", names_in_sheet,
+                        key="excel_name_picker",
+                    )
+                    if st.button("📋 Fill Profile", use_container_width=True, type="secondary"):
+                        row = df_excel[df_excel[name_col].astype(str) == chosen_name].iloc[0].to_dict()
+                        ss.prefill_data = row
+                        st.success(f"Profile filled for **{chosen_name}** — review and submit below.")
+                        st.rerun()
+                else:
+                    st.warning("Could not detect a name column in the sheet.")
+            elif df_excel is not None:
+                st.warning("The uploaded file appears to be empty.")
+
+        if ss.prefill_data:
+            p = ss.prefill_data
+            filled_name = _excel_str(p, "name", "Unknown")
+            st.info(f"Currently prefilled: **{filled_name}**")
+            if st.button("✕ Clear prefill", use_container_width=True):
+                ss.prefill_data = {}
+                st.rerun()
+
+    st.divider()
+
+    # ── Shorthand for prefill lookup ───────────────────────────────────────────
+    p = ss.prefill_data   # empty dict when nothing loaded
+
+    # ── Roles options (shared between prefill validation and widget) ───────────
+    _ROLES_OPTS = [
+        "Founder", "Investor", "Researcher", "Policy Lead",
+        "Engineer", "Corporate Sustainability Director",
+        "Speaker", "Organiser", "Other",
+    ]
+    _EXP_OPTS   = ["Junior", "Mid-level", "Senior", "Executive"]
+    _STYPE_OPTS = ["Attendee", "Investor", "Sponsor", "Partner",
+                   "Speaker", "Press / Media", "Organiser"]
+
+    # Pre-compute prefill values (safe — returns "" or [] when p is empty)
+    _p_name     = _excel_str(p, "name")
+    _p_uid      = _excel_str(p, "user_id")
+    _p_roles    = [r for r in _excel_list(p, "roles") if r in _ROLES_OPTS]
+    _p_exp      = _excel_str(p, "experience_level")
+    _p_domains  = ", ".join(_excel_list(p, "domains"))
+    _p_skills   = ", ".join(_excel_list(p, "skills"))
+    _p_interests= ", ".join(_excel_list(p, "interests"))
+    _p_event_id = _excel_str(p, "event_id")
+    _p_evt_thm  = ", ".join(_excel_list(p, "event_themes"))
+    _p_stype    = _excel_str(p, "stakeholder_type")
+    _p_city     = _excel_str(p, "city")
+    _p_country  = _excel_str(p, "country")
+    _p_opctr    = ", ".join(_excel_list(p, "operating_countries"))
+    _p_sc_raw   = _excel_list(p, "supply_chain_stage")
+    _p_sc       = [int(x) for x in _p_sc_raw if x.isdigit() and int(x) in SC_LABELS]
+    _p_stage    = _excel_str(p, "stage")
+    _p_fund_on  = _excel_bool(p, "fundraising_toggle")
+    _p_fund_amt = _excel_int(p, "fundraising_amount", 1_000_000)
+    _p_sdg_raw  = _excel_list(p, "sdg_goals")
+    _p_sdg      = [s for s in _p_sdg_raw if s in [f"SDG {i}" for i in range(1, 18)]]
+
     with st.form("profile_form", border=False):
 
         # ── Identity ──────────────────────────────────────────────────────────
         st.markdown("#### 👤 Your Profile")
-        name = st.text_input("Your name *", placeholder="e.g. Aarav Kulkarni")
-        uid  = st.text_input("Your ID", value="SEEKER-001")
+        name = st.text_input("Your name *",
+                             value=_p_name,
+                             placeholder="e.g. Aarav Kulkarni")
+        uid  = st.text_input("Your ID",
+                             value=_p_uid or "SEEKER-001")
 
         roles = st.multiselect(
-            "Role(s)", ["Founder", "Investor", "Researcher", "Policy Lead",
-                        "Engineer", "Corporate Sustainability Director",
-                        "Speaker", "Organiser", "Other"],
-            default=["Founder"],
+            "Role(s)", _ROLES_OPTS,
+            default=_p_roles or ["Founder"],
         )
-        exp = st.selectbox("Experience level",
-                           ["Junior", "Mid-level", "Senior", "Executive"], index=2)
+        _exp_idx = _EXP_OPTS.index(_p_exp) if _p_exp in _EXP_OPTS else 2
+        exp = st.selectbox("Experience level", _EXP_OPTS, index=_exp_idx)
 
         # ── Professional ──────────────────────────────────────────────────────
         st.markdown("**Professional background**")
         domains   = st.text_input("Climate domains",
+                                  value=_p_domains,
                                   placeholder="Climate Technology, Clean Energy")
         skills    = st.text_input("Skills",
+                                  value=_p_skills,
                                   placeholder="battery manufacturing, operations")
         interests = st.text_input("Interests",
+                                  value=_p_interests,
                                   placeholder="battery technology, climate finance")
 
         # ── Event ─────────────────────────────────────────────────────────────
         st.markdown("**Event context**")
-        event_id     = st.text_input("Event ID", value="EVENT-2026")
+        event_id     = st.text_input("Event ID",
+                                     value=_p_event_id or "EVENT-2026")
         event_themes = st.text_input("Event themes",
+                                     value=_p_evt_thm,
                                      placeholder="clean energy, climate finance")
 
         # ── Organization details ──────────────────────────────────────────────
         with st.expander("🏢 Organization details"):
             st.caption("Complete this section to improve organization & investor matching.")
-            s_type  = st.selectbox(
-                "Stakeholder type",
-                ["Attendee", "Investor", "Sponsor", "Partner",
-                 "Speaker", "Press / Media", "Organiser"])
+            _stype_idx = _STYPE_OPTS.index(_p_stype) if _p_stype in _STYPE_OPTS else 0
+            s_type  = st.selectbox("Stakeholder type", _STYPE_OPTS, index=_stype_idx)
             col_c, col_n = st.columns(2)
             with col_c:
-                city    = st.text_input("City", placeholder="Mumbai")
+                city    = st.text_input("City", value=_p_city, placeholder="Mumbai")
             with col_n:
-                country = st.text_input("Country", placeholder="India")
+                country = st.text_input("Country", value=_p_country, placeholder="India")
             op_ctry   = st.text_input("Operating countries",
+                                      value=_p_opctr,
                                       placeholder="India, Singapore")
             sc_stages = st.multiselect(
                 "Supply chain stage(s)",
                 options=list(SC_LABELS.keys()),
                 format_func=lambda x: f"{x} · {SC_LABELS[x]}",
+                default=_p_sc,
             )
             org_stage = st.text_input("Lifecycle stage",
+                                      value=_p_stage,
                                       placeholder="Seed / Series A / Growth")
-            fund_on   = st.checkbox("Actively fundraising")
+            fund_on   = st.checkbox("Actively fundraising", value=_p_fund_on)
             fund_amt  = None
             if fund_on:
                 fund_amt = st.number_input(
                     "Fundraising ask (USD)", min_value=0,
-                    value=1_000_000, step=100_000, format="%d",
+                    value=_p_fund_amt, step=100_000, format="%d",
                 )
-            sdg = st.multiselect("UN SDG Goals", [f"SDG {i}" for i in range(1, 18)])
+            sdg = st.multiselect("UN SDG Goals",
+                                 [f"SDG {i}" for i in range(1, 18)],
+                                 default=_p_sdg)
 
         # ── Submit ────────────────────────────────────────────────────────────
         submitted = st.form_submit_button(
