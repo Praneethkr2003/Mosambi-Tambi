@@ -261,3 +261,85 @@ def test_end_to_end_no_goals_required(event_ctx):
         assert cand.category in valid_cats, (
             f"Unexpected category: {cand.category!r}"
         )
+
+
+# ── 10. API-consistency regression (app.py call pattern) ─────────────────────
+
+def test_recommend_for_user_accepts_candidate_pool_kwarg():
+    """Regression: Mind.recommend_for_user() must accept 'candidate_pool' as a
+    keyword argument — exactly as called by app.py line 444:
+
+        candidates = ss.mind.recommend_for_user(
+            user_ctx, event_ctx,
+            candidate_pool=ALL_CANDIDATES, top_n=12,
+        )
+
+    If this test fails it means the deployed signature has drifted from the
+    caller. The fix is to check for stale .pyc bytecode cache (the most common
+    cause) or restore the parameter to the method signature.
+    """
+    import inspect
+    from mind.mind import Mind as _Mind
+
+    sig = inspect.signature(_Mind.recommend_for_user)
+    params = list(sig.parameters.keys())
+
+    assert "candidate_pool" in params, (
+        "Mind.recommend_for_user() is missing 'candidate_pool' parameter.\n"
+        "This causes: TypeError: Mind.recommend_for_user() got an unexpected "
+        "keyword argument 'candidate_pool'\n"
+        "Likely cause: stale .pyc bytecode cache. Run:\n"
+        "  find . -name '*.pyc' -delete\n"
+        "  find . -name '__pycache__' -type d -exec rm -rf {} +"
+    )
+    assert "top_n" in params, (
+        "Mind.recommend_for_user() is missing 'top_n' parameter."
+    )
+
+
+def test_recommend_for_user_app_call_pattern(event_ctx):
+    """End-to-end regression: exercise Mind.recommend_for_user() with the
+    EXACT keyword arguments used by app.py. Any signature drift will fail here
+    before it reaches the deployed app.
+
+    app.py call (line 444):
+        candidates = ss.mind.recommend_for_user(
+            user_ctx, event_ctx,
+            candidate_pool=ALL_CANDIDATES, top_n=12,
+        )
+    """
+    from mind.mind import Mind as _Mind
+    from relationships.store import InMemoryRelationshipStore
+    from service import MatchmakingService
+    from core.context import UserContext, EventContext
+    from sample_data import EVENT_ATTENDEES, ORGANIZATIONS
+
+    _ALL = EVENT_ATTENDEES + ORGANIZATIONS
+    store = InMemoryRelationshipStore()
+    svc   = MatchmakingService(store)
+    mind  = _Mind(store)
+
+    user_ctx = UserContext(
+        user_id="U-APP-REGRESSION",
+        name="App Regression User",
+        roles=["Founder"],
+        domains=["Climate Technology"],
+        extra={"country": "India", "supply_chain_stage": [3], "fundraising_toggle": True},
+    )
+    ev_ctx = EventContext(event_id="EVENT-2026", themes=["clean energy"])
+
+    # Score first (mirrors app.py run_for_user call)
+    svc.run_for_user(
+        user_ctx, ev_ctx,
+        people_pool=EVENT_ATTENDEES, org_pool=ORGANIZATIONS,
+    )
+
+    # This is the EXACT call from app.py — must not raise TypeError
+    candidates = mind.recommend_for_user(
+        user_ctx, ev_ctx,
+        candidate_pool=_ALL, top_n=12,
+    )
+
+    assert isinstance(candidates, list), (
+        "recommend_for_user() must return a list"
+    )
