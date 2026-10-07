@@ -1,0 +1,14 @@
+{
+  "matcher_id": "MM-EVENT-001",
+  "relationship_type": "EVENT_ATTENDEE_MATCH",
+  "weights": {
+    "professional_domain": 0.25,
+    "interests": 0.25,
+    "role": 0.15,
+    "networking_objective": 0.15,
+    "skills": 0.10,
+    "experience_level": 0.05,
+    "event_interest": 0.05
+  },
+  "minimum_score": 0.50
+}
